@@ -1,0 +1,1058 @@
+---
+title: "PhyloTree & Analyses"
+author: "Julie E. Larson & Ben J. Rivera"
+date: "11/19/2023"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+# Load packages
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(here)
+library(taxize)
+library(ape)
+library(rotl)
+library(phytools)
+library(flextable)
+library(ggtree)
+library(aplot)
+library(ggplotify)
+library(patchwork)
+library(gridExtra)
+library(extrafont)
+library(vegan)
+library(psych)
+library(RColorBrewer)
+library(ape)
+library(caper)
+library(ggtext)
+library(dplyr)
+library(GGally)
+library(Hmisc)
+library(lme4)
+library(performance)
+library(car)
+library(lmerTest)
+library(grid)
+
+select <- dplyr::select
+recode <- dplyr::recode
+loadfonts(device="win")       #Register fonts for Windows bitmap output
+
+```
+
+
+# Load data
+```{r}
+
+# Check that working directory is set to appropriate folder
+getwd()
+
+traits <- read.csv("Drydown_for_R_means_final.csv") #load trait means 
+traitsSE <- read.csv("Drydown_for_R_SE_final.csv") #load trait standard errors 
+survival <- read.csv("Survival.csv") #load survival data for individual plant replicates
+
+
+```
+ 
+
+
+# Checking trait data and distributions
+
+We are starting with a species X trait data matrix as the main basis for analyses, 
+using correlations among species' mean traits to understand dimensions of ecological strategy.
+
+Before we get started on any major analyses (creating phylogenetic trees, 
+conducting PCA or generating bivariate correlations), we need to check 
+trait data for multivariate normality. 
+
+These are the traits we're working with:
+
+**Weigelt et al. (2021) framework traits:**
+LMA - leaf mass per area 
+Leaf_N - leaf nitrogen
+SRL - specific root length
+Rdiam - root diameter
+RTD - root tissue density
+Shoot_Mass - dry mass of all aboveground tissue
+   *(NOTE - we use shoot mass as a size metric proxy for Weigelt's 'height' axis for seedlings)*
+   
+
+**Addtiional water response / physiology traits:**       
+Photo - Photosynthetic rate
+E - Leaf transpiration rate
+WUE - Water use efficiency (based on transpiration, E)
+RMF - Root mass fraction 
+Root_Mass - dry mass of all belowground tissue
+RLD - root length density
+
+
+**Performance metric**
+Survival_Days - number of days survived after last watering
+
+
+
+```{r}
+
+# View traits dataframe
+str(traits)
+
+```
+
+
+Now let's examine bivariate scatterplots to screen for distribution issues
+
+```{r, warning=F, message=F, fig.width = 8.5,  fig.height=8.5}
+
+# Create a subsetted dataframe of traits used in analysis
+traits_all_name <- traits %>% 
+                       select (Name, Survival_Days, Leaf_N, LMA,Shoot_Mass, SRL, 
+                               RTD, Rdiam, Photo, E, WUE, RMF, RLD,  Root_Mass )
+
+traits_all <- traits_all_name %>% select (-Name)  # Remove species name column
+
+# Examine trait data distributions
+ggpairs(traits_all)
+
+```
+
+
+## Notes on trait distributions:
+
+Things actually look pretty good! There are a few core variables that have a slight skew 
+(LMA, Survival_Days, Rdiam have slight skew, E), but this is likely not enough to impact analysis. 
+RLD is more skewed, but this trait does not end up being included in core analyses due 
+its high correlation and functional redundancy with other variables (shoot mass, root mass).
+
+
+
+
+# Phylogenetic Tree (Ben Rivera)
+
+First, we make a phylogenetic tree using online species database data (NCBI). Then, we attach trait values (special tool from a book) and calculate each trait's Blomberg K value based on our phylogeny. Finally, there is a process to visualize the data showing trait means and standard errors across the phylogenetic tree for each trait.
+
+Reference:
+
+https://taylorreiter.github.io/2017-07-28-Taxonomy-from-Species-Name-in-R/ USEFUL SOURCE
+
+
+## Create phylogenetic tree 
+
+Note that in this process, NCBI converts several taxonomic names back to older synonyms of the species (e.g., Stipa pulchra becomes Nasella pulchra). We will re-update these labels with the most recent taxonomic names later in the script. 
+
+```{r, message=F}
+names <- read.csv("TraitsToName_final.csv") #load a key for different versions of species' names
+
+name_resolved<- tnrs_match_names(names$actual, include_suppressed = TRUE) #get newest name
+
+names_class<- classification(name_resolved$unique_name, db = "ncbi") #classifies all the names based on NCBI data
+treeB2<- class2tree(names_class, check = TRUE) #turns the classes into an actual tree
+plot(treeB2) #check it out to make sure everything makes sense
+
+```
+
+
+## Estimate Blomberg's K
+
+Here we calculate Blomberg K values for each trait, using trait means and trait standard errors. The tool "match_data" comes from the book "Handbook of Trait-based Ecology: From Theory to R Tools" by de Bello et al (2021). It's a very useful book with good R materials for students new to functional trait ecology!
+
+
+
+```{r}
+
+# View original trait datasets
+str(traits)
+str(traitsSE)
+
+# Create a copy of each to modify 
+traits_phylo <- traits
+traits_phylo_se <- traitsSE
+
+# Save species names as row names
+trait_names <- tnrs_match_names(traits_phylo$Name, include_suppressed = TRUE) # Standardizing names
+trait_namesSE <- tnrs_match_names(traits_phylo_se$Name, include_suppressed = TRUE) #Standardizing names
+
+# Pare down to analyzed traits
+traits_phylo  <- traits %>% select (Survival_Days, Shoot_Mass, LMA, Leaf_N, Photo, E, WUE, SRL, Rdiam, RTD, RMF, RLD, Root_Mass)
+traits_phylo_se <- traitsSE %>% select (Survival_Days, Shoot_Mass, LMA, Leaf_N, Photo, E, WUE, SRL, Rdiam, RTD, RMF, RLD, Root_Mass)
+
+# Put species names as row names
+rownames(traits_phylo) <- trait_names$unique_name # Adding standard name to trait means
+rownames(traits_phylo_se) <- trait_namesSE$unique_name # Adding standard name to trait standard errors
+
+
+#
+# Estimate Blomberg's K using species mean traits 
+#
+
+#############################################
+#match traits using tool from Traits textbook's R materials
+source(here::here("match_data.R")) # load in special tool from book
+match_traits_phylo <- match_data(traits = traits_phylo, tree = treeB2$phylo) #links phylogeny with trait data
+#############################################
+
+TraitSignals<- data.frame(matrix(ncol = 3, nrow = 0)) #make blank dataframe to accept blomberg K data
+colnames(TraitSignals) <- c('Trait', 'K', 'Pvalue') # name columns
+TraitSignals[,2]<- as.numeric(TraitSignals[,2]) #set data type
+
+for (i in 1:length(colnames(match_traits_phylo$traits))) { #blomberg K for loop
+  TraitName<-colnames(match_traits_phylo$traits)[i] #trait name 
+  traity<- as.matrix(match_traits_phylo$traits)[,i] #extract trait means per species
+  SEofTrait<-as.matrix(traits_phylo_se)[,i] #extract trait SE per species
+  sig<- phylosig(match_traits_phylo$tree, traity, method = "K", test = TRUE, se = switch( is.na(SEofTrait[1]) == TRUE , NULL , SEofTrait  ) ) #calculate blomberg K. 'switch' uses standard errors if they are present and not if there are none in the dataframe.
+  plot.phylosig(sig)
+  TraitSignals[i,] <- c(TraitName, as.numeric(sig$K), as.numeric(sig$P)) #add to dataframe
+}
+
+TraitSignals
+```
+
+
+
+## Tree Visualization
+
+First, we make a baseline phylogenetic tree, then use a for-loop to cycle through each trait, graphing means and standard errors that are lined up with the tree (sideways), and concatenate them together.The x-axis trait labels are generated using text expressions stored within an additional cs file. 
+
+Another helpful link:
+https://yulab-smu.top/treedata-book/chapter7.html 
+
+
+### Testing things out 
+
+```{r}
+
+# Rename a few species within the tree (to most recent taxonomic names)
+# If code doesn't work, try resetting the 'recode' functionality: recode <- dplyr::recode
+match_traits_phylo$tree$tip.label <- recode(match_traits_phylo$tree$tip.label,
+                                            `Nassella pulchra` = "Stipa pulchra", 
+                                            `Lolium perenne` = "Festuca perennis", 
+                                            `Leymus condensatus` = "Elymus condensatus")
+
+
+# Separate out the trait we are looking at -- in this case, 'Survival_Days'
+d1 <- data.frame(id=match_traits_phylo$tree$tip.label, val=traits_phylo[,1], se = traits_phylo_se[,1]) 
+
+
+# General function for figure -- in this case, showing 'Survival_Days'
+ggtree(match_traits_phylo$tree) +
+  theme(text = element_text(family = "serif", size = 21))+
+  theme_tree()+
+  xlim(0,120)+
+  #geom_tiplab(hjust = -0.1, family = "serif")+
+  geom_tippoint()+
+  geom_segment(aes(x = 51, xend = 51+val, y = 1:22, yend = 1:22), data = d1, size = 3, color = "blue" )
+
+```
+
+
+## cooking dataframe
+```{r, message=F}
+traitunits <-  read.csv("TraitNamesUnits_final.csv") #load data frame for the axis labels
+
+# Filter down to traits included in analysis
+traitunits <- traitunits %>% filter( TraitName %in% TraitSignals$Trait)
+
+# Arrange to same order as trait database columns
+traitunits <- traitunits %>% arrange(factor(TraitName, levels = colnames(traits_phylo)))
+
+```
+
+
+## looping through traits
+```{r}
+
+# First make my the regular phylo tree
+treenice1<- ggtree(match_traits_phylo$tree) +
+  theme(text = element_text(family = "serif", size = 20))+
+  theme_tree()+
+  xlim(0,70)+
+  geom_tiplab(hjust = -0.1, family = "serif")+
+  #annotate("text", x = 1, y = 22, label = "(A)", family = "serif", fontface = "bold")+
+  #geom_tippoint(size = 3, align = TRUE)+
+  hexpand(.01)+ theme(legend.position='none',plot.margin = margin(t = 0,  # Top margin
+                             r = 0,  # Right margin
+                             b = 0,  # Bottom margin
+                             l = 0)) # Left margin)
+
+treenice1 # Looks nice
+
+
+traitplotlist <- list() #empty list to receive all the new graphs
+traitplotlist[[1]]<-treenice1 #add in the basic tree
+
+
+###############################
+for (i in 1:length(traits_phylo)) { # trait graph for-loop
+
+d1 <- data.frame(id=match_traits_phylo$tree$tip.label, val=traits_phylo[,i], se = traits_phylo_se[,i]) #separate out the trait we are looking at
+
+#make a blank tree with no labels
+treey<- ggtree(match_traits_phylo$tree) +
+  theme(text = element_text(family = "serif", size = 20))+
+  #theme_tree2()+
+ #xlim_tree(70)+
+ # geom_tiplab(hjust = -0.1, family = "serif", align = TRUE)+
+  #geom_tippoint(size = 3, align = TRUE)+
+  hexpand(.01)+ theme(legend.position='none')
+ # annotate("text", x = 1, y = 22, label = paste0("(",LETTERS[i+1], ")"), family = "serif", fontface = "bold")
+treey #nice
+
+# I have to manually reorder the data to match the tree
+taxaorder<- get_taxa_name(treey)  #get order of tree
+d2 <-d1 #make backup dataframe
+d2$id<- factor(d2$id, levels = rev(taxaorder)) #reorder dataframe. I have to reverse the order from the tree for some reason but it works
+
+#plotting trait data sideways
+traitplot<-ggplot(aes(id,  val), data = d2)+
+  geom_segment(aes(x= id, xend = id, y = val - ifelse( is.na(se) == TRUE , 0 , se  ), yend = val +  ifelse( is.na(se) == TRUE , 0 , se  )) )+
+  geom_point(aes(color=traits$Life_History, shape=traits$Growth_Form), size = 2)+
+  scale_shape_manual(values=c(17,16))+
+  scale_color_manual(values=c('skyblue3','dodgerblue4')) +
+  #geom_text(aes(label = id, y= val + 0.1))+
+  coord_flip() + theme_minimal() + 
+  labs(y = parse(text=traitunits$UnitsImproved[i]),  caption = paste0("Blomberg K = ", round(as.numeric(TraitSignals[i,]$K),3 ), " p = ", round(as.numeric(TraitSignals[i,]$Pvalue), 3 ), ifelse(as.numeric(TraitSignals[i,]$Pvalue )< 0.05000001, "*", "" ) ) ) + 
+  theme(legend.position='none', text =  element_text(family = "serif", size = 14), axis.text.y = element_blank(), axis.title.y = element_blank(), plot.caption = element_text(hjust = 0.5) )
+traitplot 
+
+combined<- traitplot %>% insert_left(treey) #lining up the data with the tree
+print(combined) #combined tree and trait data
+traitplotlist[[i+1]] <- as.ggplot(combined) #add to list
+
+#ggsave(paste0(traitunits$Proper[i],".tiff"), path = here("Graphs"), width = 11, height = 8.5, dpi = 600)
+}
+
+```
+
+
+## Combining and Saving
+
+```{r, fig.height=18, fig.width=10}
+
+# View all traits at once
+Phylo_Fig_All <- traitplotlist[[1]] + traitplotlist[[2]]+ traitplotlist[[3]]+ traitplotlist[[4]]+ traitplotlist[[5]]+ traitplotlist[[6]]+ traitplotlist[[7]]+ traitplotlist[[8]]+ plot_layout(ncol=2) + traitplotlist[[9]] + traitplotlist[[10]] + traitplotlist[[11]] + traitplotlist[[12]] + traitplotlist[[13]]  + traitplotlist[[14]] + 
+  plot_annotation(tag_levels = "A") & 
+  theme(plot.tag = element_text(family = "serif", size = 14, face = "bold"))
+Phylo_Fig_All 
+
+#View and save just whole-plant / aboveground traits 
+Phylo_Fig_Above <- traitplotlist[[1]] + traitplotlist[[2]]+ traitplotlist[[3]]+ traitplotlist[[4]]+ traitplotlist[[5]]+ traitplotlist[[6]]+ traitplotlist[[7]]+ traitplotlist[[8]]+ plot_layout(ncol=2) +
+  plot_annotation(tag_levels = "A") & 
+  theme(plot.tag = element_text(family = "serif", size = 14, face = "bold"))
+Phylo_Fig_Above 
+#ggsave(plot = Phylo_Fig_Above,"PhyloTraits_Above_Jul23.tiff", height = 18, width = 13,dpi = 600)
+
+#View and save just belowground traits 
+Phylo_Fig_Below <- traitplotlist[[1]] + traitplotlist[[9]] + traitplotlist[[10]] + traitplotlist[[11]] + traitplotlist[[12]] + traitplotlist[[13]]  + traitplotlist[[14]] + plot_layout(ncol=2) +
+  plot_annotation(tag_levels = "A") & 
+  theme(plot.tag = element_text(family = "serif", size = 14, face = "bold"))
+Phylo_Fig_Below
+#ggsave(plot = Phylo_Fig_Below,"PhyloTraits_Below_Jul23.tiff", height = 18, width = 13,dpi = 600)
+
+
+```
+
+
+
+# Functional Group Differences
+
+In addition to testing for phylogenetic signal, we will analyze trait differences among different
+functional groups based on growth form (grass or forb) and life history (annual or perennial). 
+
+Because the split between monocots (mostly grasses) and dicots (mostly forbs) represents the deepest split
+in our phylogenetic tree, exploring significant differences between grasses and forbs may help elucidate 
+whether significant phylogenetic signals correspond (at least in part) to this deepest split (or more recent ones).
+
+Functional groups are also a major unit in management and restoration decisions, making it useful 
+to understand whether there are any generalizable differences evidenced by trait differences.
+
+
+## ANOVA models
+
+```{r}
+#
+# We will use two-way ANOVAs to test for differences among functional groups
+#
+
+# Review structure of trait dataframe
+str(traits)
+
+# Convert growth form and life history to factors
+traits$Life_History <- as.factor(traits$Life_History)
+traits$Growth_Form <- as.factor(traits$Growth_Form)
+
+
+# Create anova models for each trait
+options(contrasts = c('contr.sum', 'contr.poly' ))
+aov_Photo <- summary( aov( Photo ~ Growth_Form * Life_History, data=traits))
+aov_E  <- summary( aov( E ~ Growth_Form * Life_History, data=traits))
+aov_WUE <- summary( aov( WUE ~ Growth_Form * Life_History, data=traits))
+aov_Leaf_N <- summary( aov( Leaf_N ~ Growth_Form * Life_History, data=traits))
+aov_LMA <- summary( aov( LMA ~ Growth_Form * Life_History, data=traits))
+aov_SRL <- summary( aov( SRL ~ Growth_Form * Life_History, data=traits))
+aov_Rdiam <- summary( aov( Rdiam ~ Growth_Form * Life_History, data=traits))
+aov_RTD <- summary( aov( RTD ~ Growth_Form * Life_History, data=traits))
+aov_RMF <- summary( aov( RMF ~ Growth_Form * Life_History, data=traits))
+aov_RLD <- summary( aov( RLD ~ Growth_Form * Life_History, data=traits))
+aov_Shoot_Mass <- summary( aov( Shoot_Mass ~ Growth_Form * Life_History, data=traits))
+aov_Root_Mass <- summary( aov( Root_Mass ~ Growth_Form * Life_History, data=traits))
+aov_Survival <- summary( aov( Survival_Days ~ Growth_Form * Life_History, data=traits))
+
+# View results (G=sig growth form effect, L=sig life history effect)
+aov_Photo       # G*
+aov_E           # G*** L*
+aov_WUE         # G* L*
+aov_Leaf_N      # L**
+aov_LMA         # G* 
+aov_SRL         # L*
+aov_Rdiam  
+aov_RTD         # L* 
+aov_RMF         # G:L**
+aov_RLD         # L***
+aov_Shoot_Mass  # L**
+aov_Root_Mass   # G* L** 
+aov_Survival    # L**
+
+```
+
+## ANOVA figures
+
+```{r, fig.height=10, fig.width=8}
+
+# Create equation for standard errors
+se <- function(x, na.rm=FALSE) {
+  if (na.rm) x <- na.omit(x)
+  sqrt(var(x)/length(x))
+} 
+
+# Estimate group means and standard errors
+trait_means <- traits %>% select(-Name,-Species,-Origin) %>% 
+  group_by( Growth_Form, Life_History) %>% 
+  summarise_all( c(mean)) %>% 
+  gather(Survival_Days:RLD, key=trait, value=mean)
+
+trait_ses <- traits %>% select(-Name,-Species,-Origin) %>%  
+  group_by( Growth_Form, Life_History) %>% 
+  summarise_all( c(se)) %>% 
+  gather(Survival_Days:RLD, key=trait, value=se)
+
+# Combine mean and standard error tables
+trait_sums <- left_join(trait_means, trait_ses, by=c('Growth_Form', 'Life_History', 'trait'))
+trait_sums$trait <- factor(trait_sums$trait, levels=c("Photo","E","WUE","Leaf_N","LMA","SRL","Rdiam","RTD","RMF","RLD","Shoot_Mass","Root_Mass", "Survival_Days"))
+levels(trait_sums$trait)
+
+# Create significance table
+anova_sig <- data.frame(levels(trait_sums$trait))
+colnames(anova_sig)[1] <- 'trait'
+anova_sig$sig_code <- c('G*','G***  L*','G*  L*','L**','G*','L*','NS','L*', 'G:L**','L***','L**','G*  L**' ,'L**')
+anova_sig$y <- c(31,4.2,12.5,5.5,65,310,0.42,0.13,0.73,0.33,0.03,0.033,43)
+anova_sig$trait <- factor(anova_sig$trait, levels=c("Photo","E","WUE","Leaf_N","LMA","SRL","Rdiam","RTD","RMF","RLD","Shoot_Mass","Root_Mass", "Survival_Days"))
+
+
+# Adjust labels
+trait.labs <- c('A<sub>area</sub> (µmol m<sup>-2</sup>s<sup>-1</sup>)','E (mol m<sup>-2</sup>s<sup>-1</sup>)','WUE (µmol CO<sub>2</sub> mmol^-1 H<sub>2</sub>O)','Leaf N (%)', 'LMA (g m<sup>-2</sup>)','SRL (m g<sup>-1</sup>)','R<sub>diam</sub> (mm)', 'RTD (g cm<sup>-3</sup>)',"RMF ('%')", 'RLD (cm root cm<sup>-3</sup> soil)','Shoot Mass (g)','Root Mass (g)','Drought Survival (days)')
+names(trait.labs) <- c("Photo","E","WUE","Leaf_N","LMA","SRL","Rdiam","RTD","RMF","RLD","Shoot_Mass","Root_Mass","Survival_Days")
+trait_sums$Growth_Form <- recode_factor(trait_sums$Growth_Form, forb = "Forb", grass = "Grass")
+
+# Figure
+fun_grp_fig <-ggplot(data=trait_sums) + 
+  geom_bar( aes(x=Growth_Form, fill=Life_History, y=mean), stat = "identity", position=position_dodge(.9),width=0.8) + 
+  geom_errorbar(aes (x=Growth_Form, fill=Life_History, ymin=mean-se, ymax=mean+se), position=position_dodge(.9), width=0.2) +
+  labs(fill="Life History", x=NULL, y="Trait Value") + 
+  scale_fill_manual(values=c('lightskyblue3','dodgerblue4')) +
+  geom_text(data=anova_sig, aes(x=1.5,y=y,label=sig_code), size=2.7) + 
+  facet_wrap(~trait, scales = 'free', ncol=3, labeller = labeller(trait=trait.labs)) + 
+  theme_classic() + 
+  theme(strip.text = element_markdown(), text=element_text(size=9),
+        strip.background = element_rect(color = "black", size = 0.5),
+        panel.border = element_rect(color = "black", fill = NA, size = 0.5))
+fun_grp_fig
+
+#ggsave(plot = fun_grp_fig ,"functional_group_barchart_May.tiff", height = 11, width = 8.5,dpi = 600)
+
+```
+
+
+
+
+# Principal components analysis (PCA)
+
+Now we'll use ordination (principal components analysis) to understand how traits are related 
+to one another. We'll pursue approaches with and without controlling for phylogeny to compare outcomes.
+
+
+## (1) Correlations between traits
+
+First step is to explore the correlations among traits, both to ensure that we aren't including highly
+correlated (r>0.70), functionally-redundant traits in analysis and to aid interpretation of PCA results.
+
+
+### No phylogenetic control:
+
+First we'll estimate traditional Pearson r correlations among traits.
+
+```{r}
+
+#View and arrange traits in the same order as above
+str(traits_all)
+traits_all <- traits_all %>% select(Photo,E,WUE,Leaf_N,LMA,SRL,Rdiam,RTD,RMF,RLD,Shoot_Mass,Root_Mass,Survival_Days)
+
+#Generate correlation matrix
+rcorr(as.matrix(traits_all),type="pearson")
+
+```
+
+
+### Phylogenetic control:
+
+Next we'll generate phylogenetically-informed correlations using PGLS 
+
+```{r}
+
+# First,
+# View our tree - Note that our tree is not fully dichotomous (binary=FALSE), which is an issue for PICs
+plot(treeB2)
+treeB2$phylo
+is.binary.tree(treeB2$phylo)
+
+# Second,
+# Create a copy trait dataframe
+traits_pgls <- traits %>% select(Photo,E,WUE,Leaf_N,LMA,SRL,RTD,RMF,RLD,Shoot_Mass,Root_Mass,Survival_Days,Rdiam)
+# Change species codes to names used in phylogenetic tree
+traits_pgls$Species <- match_traits_phylo$tree$tip.label
+
+# Third,
+# Specify the tree and trait data sources for PGLS models
+pgls_setup <- comparative.data(treeB2$phylo, traits_pgls, Species, vcv=TRUE)
+
+# Fourth,
+# Try example run for one trait pair
+trial_mod <- pgls( Photo ~ E, pgls_setup, lambda = 'ML')
+trial_mod
+pgls( pgls_setup$data[,1] ~ pgls_setup$data[,2], pgls_setup, lambda = 'ML') # Generic code gives same result
+
+
+# Fifth,
+# Set up 3 matrices to hold model R2 values, beta values, and beta p-values
+# for each pgls comparison 
+pgls_rsq <- pgls_beta <- pgls_beta_p <- matrix( 0, (length(traits_pgls)-1), (length(traits_pgls)-1))
+
+for(i in 1:(length(traits_pgls)-1)){
+    for(j in 1:(length(traits_pgls)-1)) {
+        if(j>i){
+            pgls_model <- pgls( pgls_setup$data[,i] ~ pgls_setup$data[,j], pgls_setup, lambda = 'ML')
+            pgls_rsq[i,j] <- pgls_rsq[j,i] <- summary(pgls_model)$r.squared
+            pgls_beta[i,j] <- pgls_beta[j,i] <- summary(pgls_model)$coefficients[2,1]
+            pgls_beta_p[i,j] <- pgls_beta_p[j,i] <- summary(pgls_model)$coefficients[2,4]
+        }
+    }
+}
+
+#' Set the matrix rownames
+matrix_names <- traits_pgls %>% select(-Species) %>% names()
+rownames(pgls_rsq) <- matrix_names 
+colnames(pgls_rsq) <- matrix_names 
+rownames(pgls_beta_p) <- matrix_names 
+colnames(pgls_beta_p) <- matrix_names 
+
+#'    Take sqrt of R2 to estimate r (note that these will be positive values)
+pgls_r <- sqrt(pgls_rsq)
+
+#'    Adjust the sign of r values based on beta values
+r_adjust <- pgls_beta
+r_adjust[r_adjust<0] <- -1
+r_adjust[r_adjust>0] <- 1
+corr_pgls <- pgls_r*r_adjust
+
+
+```
+
+
+
+# Principal component analysis (PCA)
+
+Now we'll conduct principal components analyses (PCA) of species' mean trait values, 
+both with raw trait data, and controlling for phylogenetic independence.
+
+
+## Prepare dataframes
+
+```{r, fig.width=6, fig.height=6}
+
+# Create subsetted dataframe with framework-only traits (incluidng just one size trait)
+f_traits <- traits_phylo %>% select(LMA, Leaf_N, SRL, Rdiam, RTD, Shoot_Mass)
+pairs(f_traits)
+
+# Create scaled version
+f_traits_s <- scale(f_traits)
+
+```
+
+
+## WITH Phylogeny:  PCA of morphological framework traits 
+
+**Notes**
+* This is phylogenetically controlled
+* This includes 6 traits that are in or adjacent to Weigelt's framework 
+
+This approach is based on the example from the phyl.pca documentation (phytools package):
+https://search.r-project.org/CRAN/refmans/phytools/html/phyl.pca.html
+
+Here we run PCA with method="lambda" which uses an optimization function to 'optimize' lambda 
+somewhere between 0 (which would essentially assume full independence of species) and 1 (which
+would assume full brownian motion). 
+
+We let phly.pca optimize lambda, and end up with a value of 0 with a PCA that is identical NON-phylogenetically-controlled PCA:
+
+
+```{r, fig.width=6, fig.height=9}
+
+## Run phylogenetic PCA using method = lambda
+phylo_pca <- phyl.pca( treeB2$phylo, f_traits_s, method = "lambda", mode="cov")
+
+phylo_pca$lambda  # See lambda value
+phylo_pca$logL    # See log-likelihood associated with lambda
+summary(phylo_pca)  # Print results
+print(phylo_pca) 
+
+# Save trait loading vectors (correlation of each trait with the axis)
+phylo_pca_vec <- data.frame(phylo_pca$L)
+
+# Save species scores vectors
+phylo_pca_spp  <- data.frame(phylo_pca$S)
+phylo_pca_spp_bind <- cbind( phylo_pca_spp, traits)
+phylo_pca_spp_bind$Growth_Form <- recode_factor(phylo_pca_spp_bind$Growth_Form, forb = "Forb", grass = "Grass")
+
+# Show correlations between traits and PCs
+phylo_pca_spp_corr <- phylo_pca_spp_bind %>% dplyr::select (LMA, Leaf_N, SRL, Rdiam, RTD, Shoot_Mass, Survival_Days, WUE,Photo, RMF, E, PC1:PC6)
+phylo_pca_corrs_all <- data.frame(cor(phylo_pca_spp_corr)[1:11,])
+phylo_pca_corrs <- phylo_pca_corrs_all %>% select(PC1:PC6) 
+phylo_pca_corrs_weigelt <- phylo_pca_corrs[1:6,]
+phylo_pca_corrs_extra <- phylo_pca_corrs[7:11,]
+
+# Add trait label locations for the first 3 PCs
+phylo_pca_corrs_weigelt$lab_1 <- c(0.77,-1.1,1.17,-.55,-.8,.55)
+phylo_pca_corrs_weigelt$lab_2 <- c(-.42,.2,.3,-.9,.7,.5)
+phylo_pca_corrs_weigelt$lab_3 <- c(-.2,-.25,-.39,.39,0,.9)
+phylo_pca_corrs_weigelt$label <- c("LMA","Leaf N","SRL","Rdiam","RTD","Shoot Mass")
+
+phylo_pca_corrs_extra$lab_1 <- c(-0.65,-.55,0,0.5, -0.75)
+phylo_pca_corrs_extra$lab_2 <- c(-0.1,0.2,-0.25, -0.6,0)
+phylo_pca_corrs_extra$lab_3 <- c(-0.73,-0.3,-0.15,0,0.15)
+phylo_pca_corrs_extra$label <- c("Survival Days","WUE","A area","E","RMF")
+
+
+# Correlation Figs
+phylo_pca_fig_1a <- ggplot () +
+  geom_segment(mapping=aes(x=0, y=0, xend=PC1, yend=PC2), size=1, data=phylo_pca_corrs_weigelt)+
+  geom_segment(mapping=aes(x=0, y=0, xend=PC1, yend=PC2), size=0.5, color="darkred", data=phylo_pca_corrs_extra) +
+  geom_point(aes(x=PC1, y=PC2, shape=Growth_Form, col=Life_History), cex=2.5, data=phylo_pca_spp_bind)+
+  labs(x="PC Axis 1 - 45.6%", y="PC Axis 2 - 21%",col="Life History", shape= "Growth Form") +
+  geom_text(mapping=aes(x=lab_1, y=lab_2, label = label), size=2.5, data=phylo_pca_corrs_weigelt) +
+  geom_text(mapping=aes(x=lab_1, y=lab_2, label = label), size=2.5, color="darkred", data=phylo_pca_corrs_extra) +
+  scale_shape_manual(values=c(17,16))+
+  scale_color_manual(values=c('lightskyblue3','dodgerblue4')) +
+  #stat_ellipse(aes(x=PC1, y=PC2,color=growth_form, group=growth_form),type = "norm", level=0.95, data=veg_e_species) +
+  theme_classic() + 
+  theme(text=element_text(size=8))
+
+phylo_pca_fig_1b <- ggplot () +
+  geom_segment(mapping=aes(x=0, y=0, xend=PC1, yend=PC3), size=1, data=phylo_pca_corrs_weigelt)+
+  geom_segment(mapping=aes(x=0, y=0, xend=PC1, yend=PC3), size=0.5, color="darkred", data=phylo_pca_corrs_extra) +
+  geom_point(aes(x=PC1, y=PC3, shape=Growth_Form, col=Life_History), cex=2.5, data=phylo_pca_spp_bind)+
+  labs(x="PC Axis 1 - 45.6%", y="PC Axis 3 - 14.8%",col="Life History", shape= "Growth Form") +
+  geom_text(mapping=aes(x=lab_1, y=lab_3, label = label), size=2.5, data=phylo_pca_corrs_weigelt) +
+  geom_text(mapping=aes(x=lab_1, y=lab_3, label = label), size=2.5, color="darkred", data=phylo_pca_corrs_extra) +
+  scale_shape_manual(values=c(17,16))+
+  scale_color_manual(values=c('lightskyblue3','dodgerblue4')) +
+  #stat_ellipse(aes(x=PC1, y=PC2,color=growth_form, group=growth_form),type = "norm", level=0.95, data=veg_e_species) +
+  theme_classic() + 
+  theme(text=element_text(size=8), legend.position = 'none')
+
+
+phylo_pca_new <- (phylo_pca_fig_1a + plot_layout(guides='keep')) / phylo_pca_fig_1b + plot_layout( guides ='collect') + plot_annotation(tag_levels = "A") & 
+  theme(plot.tag = element_text(family = "serif", size = 10, face = "bold"))
+phylo_pca_new
+
+
+#ggsave(plot = phylo_pca_new ,"Phylogenetic_PCA.tiff", height = 8, width = 5.5,dpi = 600)
+
+```
+
+
+# WITHOUT Phylogeny:  PCA of morphological framework traits 
+
+Including PCA without phylogenetic control for comparison. These are IDENTICAL to 
+phylogenetic ordinations because Lambda was optimized at 0 -- but we include them to affirm that.
+
+
+```{r, fig.width=6, fig.height=9}
+
+## check traits
+str(f_traits_s)
+
+## Run PCA
+pca_l <- rda(f_traits_s ~ 1, scale=FALSE)
+summary(pca_l) # Print results
+
+# Save trait loading vectors (correlation of each trait with the axis)
+pca_vec_L <- data.frame(summary(pca_l)$species)
+
+# Save species scores vectors
+pca_spp_L  <-  data.frame(summary(pca_l)$sites)
+pca_spp_L_bind <- cbind(pca_spp_L, traits)
+pca_spp_L_bind$Growth_Form <- recode_factor(pca_spp_L_bind$Growth_Form, forb = "Forb", grass = "Grass")
+
+# Show correlations between traits and PCs
+pca_spp_L_corr <- pca_spp_L_bind %>% dplyr::select (LMA, Leaf_N, SRL, Rdiam, RTD, Shoot_Mass, Survival_Days, WUE,Photo,E, RMF, PC1:PC6)
+pca_corrs_all <- data.frame(cor(pca_spp_L_corr)[1:11,])
+pca_corrs <- pca_corrs_all %>% select(PC1:PC6) 
+pca_corrs_weigelt <- pca_corrs[1:6,]
+pca_corrs_extra <- pca_corrs[7:11,]
+
+# Add trait label locations for the first 3 PCs
+pca_corrs_weigelt$lab_1 <- c(0.83,-1.1,.9,-.5,-.75,.55)
+pca_corrs_weigelt$lab_2 <- c(-.42,.15,.3,-.9,.7,.5)
+pca_corrs_weigelt$lab_3 <- c(-.1,-.15,-.37,.39,0,.9)
+pca_corrs_weigelt$label <- c("LMA","Leaf N","SRL","Rdiam","RTD","Shoot Mass")
+
+pca_corrs_weigelt$lab_1 <- c(0.77,-1.1,1.17,-.55,-.75,.55)
+pca_corrs_weigelt$lab_2 <- c(-.42,.2,.3,-.9,.7,.5)
+pca_corrs_weigelt$lab_3 <- c(-.2,-.25,-.39,.39,0,.9)
+pca_corrs_weigelt$label <- c("LMA","Leaf N","SRL","Rdiam","RTD","Shoot Mass")
+
+# Separate out leaf and root traits
+pca_corrs_weigelt_AG <- pca_corrs_weigelt %>% filter (label != "SRL") %>%
+                                                filter (label != "Rdiam") %>%
+                                                filter (label != "RTD") 
+pca_corrs_weigelt_BG <- pca_corrs_weigelt %>% filter (label != "LMA") %>%
+                                                filter (label != "Leaf N") %>%
+                                                filter (label != "Shoot Mass") 
+
+
+pca_corrs_extra$lab_1 <- c(-.45,-.55,-.27, 0.5, -0.65)
+pca_corrs_extra$lab_2 <- c(-0.1,0.2,-0.2, -0.6, 0)
+pca_corrs_extra$lab_3 <- c(-0.67,-0.2,-0.15,0, 0.15)
+pca_corrs_extra$label <- c("Survival Days","WUE","A area","E","RMF")
+
+
+
+# Correlation Figs
+pca_fig_1a <- ggplot () +
+  geom_segment(mapping=aes(x=0, y=0, xend=PC1, yend=PC2), size=0.5, data=pca_corrs_weigelt)+
+  geom_segment(mapping=aes(x=0, y=0, xend=PC1, yend=PC2), size=0.5, color="darkred", data=pca_corrs_extra) +
+  geom_point(aes(x=PC1, y=PC2, shape=Growth_Form, col=Life_History), cex=2.5, data=pca_spp_L_bind)+
+  labs(x="PC Axis 1 - 45.6%", y="PC Axis 2 - 21%",col="Life History", shape= "Growth Form") +
+  #geom_text(mapping=aes(x=lab_1, y=lab_2, label = label), size=2.5, data=pca_corrs_weigelt) +
+  geom_text(mapping=aes(x=lab_1, y=lab_2, label = label), size=2.5, color="black", data=pca_corrs_weigelt_AG) +
+  geom_text(mapping=aes(x=lab_1, y=lab_2, label = label), size=2.5,  color="black", data=pca_corrs_weigelt_BG) +
+  geom_text(mapping=aes(x=lab_1, y=lab_2, label = label), size=2.5, color="darkred", data=pca_corrs_extra) +
+  scale_shape_manual(values=c(17,16))+
+  scale_color_manual(values=c('lightskyblue3','dodgerblue4')) +
+  #stat_ellipse(aes(x=PC1, y=PC2,color=growth_form, group=growth_form),type = "norm", level=0.95, data=veg_e_species) +
+  theme_classic() + 
+  theme(text=element_text(size=8))
+
+pca_fig_1b <- ggplot () +
+  geom_segment(mapping=aes(x=0, y=0, xend=PC1, yend=PC3), size=0.5, data=pca_corrs_weigelt)+
+  geom_segment(mapping=aes(x=0, y=0, xend=PC1, yend=PC3), size=0.5, color="darkred", data=pca_corrs_extra) +
+  geom_point(aes(x=PC1, y=PC3, shape=Growth_Form, col=Life_History), cex=2.5, data=pca_spp_L_bind)+
+  labs(x="PC Axis 1 - 45.6%", y="PC Axis 3 - 14.8%",col="Life History", shape= "Growth Form") +
+  #geom_text(mapping=aes(x=lab_1, y=lab_3, label = label), size=2.5, data=pca_corrs_weigelt) +
+  geom_text(mapping=aes(x=lab_1, y=lab_3, label = label), size=2.5, color="black", data=pca_corrs_weigelt_AG) +
+  geom_text(mapping=aes(x=lab_1, y=lab_3, label = label), size=2.5,  color="black", data=pca_corrs_weigelt_BG) +
+  geom_text(mapping=aes(x=lab_1, y=lab_3, label = label), size=2.5, color="darkred", data=pca_corrs_extra) +
+  scale_shape_manual(values=c(17,16))+
+  scale_color_manual(values=c('lightskyblue3','dodgerblue4')) +
+  #stat_ellipse(aes(x=PC1, y=PC2,color=growth_form, group=growth_form),type = "norm", level=0.95, data=veg_e_species) +
+  theme_classic() + 
+  theme(text=element_text(size=8), legend.position = "none")
+
+
+pca_new <- (pca_fig_1a + plot_layout(guides='keep')) / pca_fig_1b + plot_layout( guides ='collect') +  plot_annotation(tag_levels = "A") & 
+  theme(plot.tag = element_text(family = "serif", size = 10, face = "bold"))
+pca_new
+
+#ggsave(plot = pca_new ,"PCA.tiff", height = 8, width = 5,dpi = 600)
+
+
+
+```
+
+
+
+We also need to make a figure of SRL, root diameter and root tissue density
+
+```{r fig.width=6, fig.height=4}
+
+title_exp <- expression(Root~tissue~density~(g~cm^{-3}))
+
+root_fig <- ggplot(data=pca_spp_L_bind) + 
+  geom_point( aes(x=Rdiam, y= SRL, color=RTD, shape=Growth_Form), cex=2.5) + 
+  labs(x="Root Diameter (mm)", y='Specific root length (m g^-1)', shape="Growth form",color=title_exp, )  +
+  scale_shape_manual(values=c(17,16))+
+  scale_colour_gradient(low = 'slategray2', high = 'midnightblue') +
+  theme(axis.title.x = element_markdown(), axis.title.y = element_markdown()) + 
+  theme_classic() + 
+  theme(text=element_text(size=9))
+root_fig
+
+#ggsave(plot = root_fig ,"Root_Figure.tiff",  height = 4.5, width = 6.5,dpi = 600)
+
+
+```
+
+
+# Survival models
+
+Finally, we'll predict survival duration under drought (i.e. number of days that 
+individual plants survived once watering ceased) as a function of (1) species' PC scores 
+from the non-phylogenetically controlled  analysis, or (2) species' mean traits.
+
+
+## Models based on species' PC scores
+
+```{r fig.width=10, fig.height=4}
+
+#' **Prepare data**
+#' 
+#' View individual (plant-level) survival data (i.e. number of days survived with no watering)
+str(survival)
+#' Check that species names match between survival and trait datasets
+unique(survival$Species)
+unique(pca_spp_L_bind$Species)
+#' We have one mismatch because *elco* was changed to *leco* (Elymus was updated to Laymus)
+#'   Need to recode this in the survival dataset
+pca_spp_L_bind$Species <- as.factor(pca_spp_L_bind$Species)
+pca_spp_L_bind$Species <- recode_factor(pca_spp_L_bind$Species, elco="leco")
+unique(pca_spp_L_bind$Species)
+#' Combine dataframe of species' mean PC scores and traits with individual-level survival data
+joint_scores <- merge(pca_spp_L_bind, survival, by="Species")
+#' Scale all PC's and traits
+joint_scores_scaled <- joint_scores %>% mutate_if(is.numeric, scale)
+unique(joint_scores_scaled$Species)
+
+#' **Create a full mixed model with PCs**
+#' 
+survival_mixed_pc = lmer(Survival ~ PC1 + PC2 + PC3 + (1 | Species), data = joint_scores_scaled)
+#' Preview full model output
+summary(survival_mixed_pc)
+#' Preview R2 values for full model,
+#  including fixed effects (marginal) and fixed + random effects (conditional)
+r2(survival_mixed_pc)      
+
+
+#' **Step-wise regression**
+#' 
+#' To obtain a final model, we'll use backward elimination of random and fixed effects
+#'   We will use lmerTest::step() with default alpha-levels: 
+#'     alpha=0.1 for random effects
+#'     alpha=0.05 for fixed effects
+step_res_pc <- step(survival_mixed_pc)
+final_pc <- get_model(step_res_pc)
+
+#' **View final model output**
+#' 
+final_pc
+#' View output
+summary(final_pc)
+confint(final_pc)
+# View R2 for fixed effects (marginal) and fixed + random effects (conditional)
+r2(final_pc)  
+
+#' Save fitted values from the model
+joint_scores_scaled$fit <- predict(final_pc)
+
+
+```
+
+
+## Models based on species' traits
+
+```{r, fig.width=8.5, fig.height=12}
+
+
+#' **Prepare data**
+#' 
+#'   Check scaled traits for analysis 
+str(joint_scores_scaled, give.attr=F)
+
+
+#' **Create a full mixed model with all traits**
+#' 
+#' Create mixed model with traits
+#' 
+survival_mixed_trait3 = lmer(Survival ~ Photo + WUE + Shoot_Mass + LMA + SRL + Rdiam +
+                        RTD + Leaf_N + RMF + E + (1 | Species), data = joint_scores_scaled)
+#' Preview full model output
+summary(survival_mixed_trait3)
+confint(survival_mixed_trait3)
+# View R2 for fixed effects (marginal) and fixed + random effects (conditional)
+r2(survival_mixed_trait3)  
+vif(survival_mixed_trait3)
+
+
+#' There is a fairly high VIF for E (transpiration rate) when all terms are included.
+#' Check that this is resolved in the final model after step-wise selection 
+#' 
+#' **Step-wise regression**
+#' 
+#' To obtain a final model, we'll use backward elimination of random and fixed effects
+#'   We will use lmerTest::step() with default alpha-levels: 
+#'     alpha=0.1 for random effects
+#'     alpha=0.05 for fixed effects
+step_res_traits <- step(survival_mixed_trait3)
+final_traits <- get_model(step_res_traits)
+
+
+#' **View final model output**
+#' 
+final_traits
+#' View output
+summary(final_traits)
+confint(final_traits)
+# View R2 for fixed effects (marginal) and fixed + random effects (conditional)
+r2(final_traits)  
+vif(final_traits)
+
+#' Save fitted values from the model
+joint_scores_scaled$fit_traits_m <- predict(final_traits, re.form=NA)
+joint_scores_scaled$fit_traits_c <- predict(final_traits, re.form=NULL)
+
+
+```
+
+## Making figures
+
+```{r  fig.width=8, fig.height=7.5}
+
+
+#' ** PC Model **
+#'
+#' Save coefficients and confidence intervals
+survival_pc_final <- summary(final_pc)
+survival_pc_cof_final <- data.frame(survival_pc_final$coefficients)[2,]
+survival_pc_ci_final <- data.frame(confint(final_pc))[4,]
+survival_pc_dat_final <- cbind(survival_pc_cof_final, survival_pc_ci_final)
+survival_pc_dat_final$PC <- factor(row.names(survival_pc_dat_final))
+colnames(survival_pc_dat_final)[6] <- 'CI_25'
+colnames(survival_pc_dat_final)[7] <- 'CI_975'
+
+#' **Create figures**
+#' 
+#' Fixed effect size 
+survival_pc_fig <- ggplot(survival_pc_dat_final) + 
+  geom_point(aes(x=PC, y=Estimate),cex=3) +
+  geom_errorbar(aes(x=PC, ymin=CI_25, ymax=CI_975), width=0) + 
+  geom_hline(aes(yintercept=0), linetype=3) +
+  ylim(-1.1,0.1)+
+  coord_flip() + 
+  theme_classic() + 
+  labs(x=NULL,y=NULL)+
+  theme(text=element_text(size=12))
+
+#' Scatterplot 
+#' 
+#' Survival ~ PC score (individuals)
+survival_pc_scatter_ind <- ggplot(joint_scores_scaled) + 
+  geom_point( aes(x=PC3, y=Survival, shape=Growth_Form, color=Life_History),cex=2, position=position_jitter(width=0.08, height=0)) +
+  # Add line with slope and intercept from mixed model: final_pc
+  geom_abline(aes(intercept=`(Intercept)`, slope=PC3), as.data.frame(t(fixef(final_pc))))+
+  scale_shape_manual(values=c(17,16))+
+  scale_color_manual(values=c('lightskyblue3','dodgerblue4'))+
+  theme_classic() + 
+  labs(x='PC3', y="Drought Survival (days)",shape='Growth Form', color='Life History')+
+  theme(text=element_text(size=10))
+survival_pc_scatter_ind
+
+
+
+#' ** Traits Model **
+#'
+#' Save coefficients and confidence intervals
+survival_trait3 <- summary(final_traits)
+survival_trait_cof3 <- data.frame(survival_trait3$coefficients)[2:3,]
+survival_trait_ci3 <- data.frame(confint(final_traits))[4:5,]
+survival_trait_dat3 <- cbind(survival_trait_cof3, survival_trait_ci3)
+survival_trait_dat3$trait <- factor(row.names(survival_trait_dat3))
+colnames(survival_trait_dat3)[6] <- 'CI_25'
+colnames(survival_trait_dat3)[7] <- 'CI_975'
+survival_trait_dat3$trait <- recode_factor(survival_trait_dat3$trait, Shoot_Mass='Shoot Mass')
+survival_trait_dat3$trait <- factor(survival_trait_dat3$trait, levels = c("E","Shoot Mass"))
+                                       
+#' **Create figures**
+#' 
+#' Fixed effect sizes 
+survival_trait_fig <- ggplot(survival_trait_dat3) + 
+  geom_point(aes(x=trait, y=Estimate),cex=3) +
+  geom_errorbar(aes(x=trait, ymin=CI_25, ymax=CI_975), width=0) + 
+  geom_hline(aes(yintercept=0),linetype=3) +
+  ylim(-1.1,0.1)+
+  coord_flip() + 
+  theme_classic() + 
+  labs(x=NULL,y="Standard Regression Coefficient")+
+  theme(text=element_text(size=10))+ 
+  theme(axis.text.y = element_markdown(size=10))
+
+#' Scatterplots
+#' 
+#' Survival ~ shoot mass (individuals)
+survival_shoot_scatter_ind <- ggplot(joint_scores_scaled) + 
+  geom_point( aes(x=Shoot_Mass, y=Survival, shape=Growth_Form, color=Life_History),cex=2, position=position_jitter(width=0.08, height=0)) +
+  annotation_custom(grob= textGrob(label="Drought Survival (days)", rot=90, gp=gpar(fontsize=10), x=-25, default.units="pt"))+
+  coord_cartesian(ylim=c(-1.5,2.5),clip = "off") +
+  # Add line with slope and intercept from mixed model: final_traits
+  geom_abline(aes(intercept=`(Intercept)`, slope=Shoot_Mass), as.data.frame(t(fixef(final_traits))))+
+  scale_shape_manual(values=c(17,16))+
+  scale_color_manual(values=c('lightskyblue3','dodgerblue4'))+
+  theme_classic() + 
+  labs(x='Shoot Mass (g)', y="Drought Survival (days)",shape='Growth Form', color='Life History')+
+  theme(text=element_text(size=10), axis.title.y=element_blank())
+survival_shoot_scatter_ind
+
+
+#' Survival ~ E (individuals)
+#' 
+survival_E_scatter_ind <- ggplot(joint_scores_scaled) + 
+  geom_point( aes(x=E, y=Survival, shape=Growth_Form, color=Life_History),cex=2, position=position_jitter(width=0.08, height=0)) +
+  # Add line with slope and intercept from mixed model: final_traits
+  geom_abline(aes(intercept=`(Intercept)`, slope=E), as.data.frame(t(fixef(final_traits))))+
+  scale_shape_manual(values=c(17,16))+
+  scale_color_manual(values=c('lightskyblue3','dodgerblue4'))+
+  theme_classic() + 
+  labs(x='E (mol m<sup>-2</sup>s<sup>-1</sup>)', y="Drought Survival (days)",shape='Growth Form', color='Life History')+
+  theme(axis.title.x = element_markdown(), text=element_text(size=10))
+survival_E_scatter_ind
+
+
+
+#' ** Combined figures **
+#'
+
+#' Set up a patchwork structure for panels in the final figure
+design_test2 <- "
+  1111133333
+  2222233333
+  2222233333
+  4444455555
+  4444455555
+  4444455555
+  4444455555
+"
+
+#'  Create figure
+survival_traits_only_fig <- survival_pc_fig  + survival_trait_fig + survival_pc_scatter_ind +
+  survival_shoot_scatter_ind + survival_E_scatter_ind + plot_layout( design = design_test2, guides= "collect") +  plot_annotation(tag_levels = "A") &  theme(plot.tag = element_text(family = "serif", size = 12, face = "bold"))
+survival_traits_only_fig 
+
+ggsave(plot = survival_traits_only_fig  ,"Survival_traits_only_fig.tiff", height = 7, width = 8,dpi = 600)
+
+
+
+
+```
+
+
